@@ -1,0 +1,55 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "Statement1",
+            "Effect": "Allow",
+            "Action": [
+                "kms:ListAliases",
+                "kms:ListKeys",
+                "kms:DescribeKey",
+                "kms:Decrypt",
+                "kms:Encrypt",
+                "kms:GenerateDataKey",
+                "kms:GenerateDataKeyPair",
+                "kms:PutKeyPolicy"
+            ],
+            "Resource": [
+                "arn:aws:kms:us-east-1:750300312428:key/22b95358-c482-4ee0-bd01-21901ffdc33b"
+            ]
+        },
+        {
+            "Sid": "Statement2",
+            "Effect": "Allow",
+            "Action": [
+                "ssm:AddTagsToResource",
+                "ssm:RemoveTagsFromResource",
+                "ssm:PutResourcePolicy",
+                "ssm:DeleteResourcePolicy",
+                "ssm:UnlabelParameterVersion",
+                "ssm:PutParameter",
+                "ssm:LabelParameterVersion",
+                "ssm:DeleteParameters",
+                "ssm:DeleteParameter",
+                "ssm:GetParameterHistory",
+                "ssm:GetParameters",
+                "ssm:GetParameter",
+                "ssm:DescribeParameters",
+                "ssm:GetParametersByPath"
+            ],
+            "Resource": [
+                "*"
+            ]
+        },
+        {
+            "Sid": "Statement3",
+            "Effect": "Allow",
+            "Action": [
+                "autoscaling:*"
+            ],
+            "Resource": [
+                "*"
+            ]
+        }
+    ]
+}

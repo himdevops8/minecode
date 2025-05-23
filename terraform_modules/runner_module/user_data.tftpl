@@ -1,0 +1,110 @@
+#!/bin/bash -xe
+exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+
+echo "User data script started at $(date)"
+
+# stop ssm agent to prevent rpm lock
+echo "Stopping ssm-agent"
+sudo systemctl stop amazon-ssm-agent || echo "Failed to stop ssm-agent, or already stopped."
+
+echo "Updating packages"
+sudo yum update -y
+
+echo "Installing dependencies: amazon-ecr-credential-helper git docker curl policycoreutils-python-utils awscli"
+sudo yum install -y amazon-ecr-credential-helper git docker curl policycoreutils-python-utils awscli
+
+echo "Configuring Docker credHelper for ECR"
+sudo mkdir -p /root/.docker
+sudo tee /root/.docker/config.json > /dev/null <<EOF
+{
+  "credHelpers": {
+    "${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com": "ecr-login"
+  }
+}
+EOF
+
+sudo systemctl start docker
+sudo systemctl enable docker
+echo "Docker service started and enabled."
+
+echo "Downloading GitLab Runner binary"
+sudo curl -L --output /usr/local/bin/gitlab-runner https://gitlab-runner-downloads.s3.amazonaws.com/latest/binaries/gitlab-runner-linux-amd64
+sudo chmod +x /usr/local/bin/gitlab-runner
+echo "GitLab Runner binary installed."
+
+sudo useradd --comment 'GitLab Runner' --create-home gitlab-runner --shell /bin/bash || echo "User gitlab-runner likely already exists."
+sudo usermod -a -G docker gitlab-runner
+echo "gitlab-runner user configured and added to docker group."
+
+sudo gitlab-runner install --user=gitlab-runner --working-directory=/home/gitlab-runner
+echo "GitLab Runner service installed."
+
+sudo mkdir -p /etc/systemd/system/gitlab-runner.service.d/
+sudo tee /etc/systemd/system/gitlab-runner.service.d/override.conf > /dev/null <<EOF
+[Service]
+Environment=AWS_SDK_LOAD_CONFIG=true
+Environment=AWS_REGION=${aws_region}
+Environment=AWS_DEFAULT_REGION=${aws_region}
+EOF
+sudo systemctl daemon-reload
+echo "GitLab Runner service override configured and systemd reloaded."
+
+echo "Fetching GitLab Runner registration token from Secrets Manager..."
+GITLAB_REGISTRATION_TOKEN=$(aws secretsmanager get-secret-value --secret-id "${gitlab_secret_arn}" --region "${aws_region}" --query SecretString --output text --cli-connect-timeout 10 --cli-read-timeout 10)
+FETCH_EXIT_CODE=$?
+
+if [ $FETCH_EXIT_CODE -ne 0 ] || [ -z "$GITLAB_REGISTRATION_TOKEN" ] || [ "$GITLAB_REGISTRATION_TOKEN" == "null" ]; then
+    echo "ERROR: Failed to retrieve GitLab registration token. Secret ARN: ${gitlab_secret_arn}, Region: ${aws_region}, Exit Code: $FETCH_EXIT_CODE"
+    sudo systemctl start amazon-ssm-agent || echo "Failed to start ssm-agent after token fetch failure."
+    exit 1
+fi
+echo "Successfully fetched registration token."
+
+sudo mkdir -p /etc/gitlab-runner
+sudo chown gitlab-runner:gitlab-runner /etc/gitlab-runner
+
+RUNNER_DESCRIPTION_NAME_FOR_GITLAB="${gr_name_for_gitlab_registration}" # This variable comes from templatefile
+RUNNER_TAGS_FOR_GITLAB="${runner_tags_list_comma_separated}" # This variable comes from templatefile
+
+echo "Registering runner: URL=${gr_url}, Description=${RUNNER_DESCRIPTION_NAME_FOR_GITLAB}, Tags=${RUNNER_TAGS_FOR_GITLAB}"
+# Using a unique name for the runner section in config.toml can help if multiple runners are on one host (not our case per EC2)
+# The $HOSTNAME shell variable will make this name unique per EC2 instance.
+CONFIG_TOML_RUNNER_SECTION_NAME="$HOSTNAME-${RUNNER_DESCRIPTION_NAME_FOR_GITLAB}"
+
+sudo gitlab-runner register \
+  --non-interactive \
+  --url "${gr_url}" \
+  --registration-token "$GITLAB_REGISTRATION_TOKEN" \
+  --executor "docker" \
+  --docker-image "${default_docker_image_executor}" \
+  --description "${RUNNER_DESCRIPTION_NAME_FOR_GITLAB}" \
+  --maintenance-note "GitLab Runner deployed by Terraform" \
+  --tag-list "${RUNNER_TAGS_FOR_GITLAB}" \
+  --run-untagged="false" \
+  --docker-volumes /var/run/docker.sock:/var/run/docker.sock \
+  --docker-volumes /root/.docker:/root/.docker \
+  --locked="false" \
+  --config "/etc/gitlab-runner/config.toml" \
+  --name "$CONFIG_TOML_RUNNER_SECTION_NAME"
+REGISTRATION_EXIT_CODE=$?
+
+if [ $REGISTRATION_EXIT_CODE -ne 0 ]; then
+    echo "ERROR: GitLab Runner registration failed with exit code $REGISTRATION_EXIT_CODE."
+    sudo systemctl start amazon-ssm-agent || echo "Failed to start ssm-agent after registration failure."
+    exit 1
+fi
+echo "GitLab Runner registration command executed."
+
+echo "Configuring concurrent jobs in /etc/gitlab-runner/config.toml"
+if grep -q "^concurrent[[:space:]]*=" /etc/gitlab-runner/config.toml; then
+  sudo sed -i "s/^concurrent[[:space:]]*=.*$/concurrent = ${concurrent_jobs_count}/" /etc/gitlab-runner/config.toml
+else
+  echo -e "\nconcurrent = ${concurrent_jobs_count}" | sudo tee -a /etc/gitlab-runner/config.toml > /dev/null
+fi
+echo "Concurrent jobs set to ${concurrent_jobs_count}."
+
+sudo systemctl restart gitlab-runner
+echo "GitLab Runner service restarted."
+
+sudo systemctl start amazon-ssm-agent || echo "Failed to start ssm-agent at the end."
+echo "User data script finished successfully at $(date)."
